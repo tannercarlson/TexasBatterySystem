@@ -1,0 +1,92 @@
+import gurobipy as gp
+from gurobipy import GRB
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Define parameters
+peak_charge_rate = 18.17  # Peak demand charge ($/kW)
+efficiency = 0.95  # Storage efficiency
+P = 11500  # Storage power rating (kW)
+E = 13500  # Storage energy capacity (kWh)
+total_households = 26e6  # Total households in ERCOT
+
+# Load demand and price data
+load_data = pd.read_csv('2021_load_feb.csv')  # Replace with the actual file name
+feb_prices = pd.read_csv('houston_feb_data_2021.csv')
+
+# Replace 'DEMAND' and 'Settlement Point Price' with the actual column names
+demand = load_data['DEMAND'] * 1000 / total_households  # Convert MW to kWh and downscale
+price = feb_prices['Settlement Point Price']
+
+# Check for data alignment
+n_time = len(demand)
+if len(price) != n_time:
+    raise ValueError("Mismatch in length of demand and price data.")
+
+# Initialize the Gurobi model
+model = gp.Model("PeakShaving")
+
+# Variables
+discharge = model.addVars(n_time, lb=0, ub=P, name="discharge")  # Discharge power (kW)
+charge = model.addVars(n_time, lb=0, ub=P, name="charge")        # Charge power (kW)
+soc = model.addVars(n_time, lb=0, ub=E, name="soc")              # State of charge (kWh)
+peak_demand = model.addVar(name="peak_demand")                   # Peak demand (kW)
+
+# Constraints
+for t in range(n_time):
+    # Energy balance for state of charge
+    if t == 0:
+        model.addConstr(soc[t] == 0.5 * E)  # Assume SOC starts at 50% of capacity
+    else:
+        model.addConstr(soc[t] == soc[t - 1] + charge[t] * efficiency - discharge[t] / efficiency)
+
+    # Ensure SOC remains within bounds
+    model.addConstr(soc[t] >= 0)  # Avoid negative SOC
+    model.addConstr(soc[t] <= E)
+
+    # Track peak demand
+    model.addConstr(peak_demand >= demand[t] - discharge[t] + charge[t])
+
+# Objective function: Minimize total cost
+energy_cost = gp.quicksum((demand[t] - discharge[t] + charge[t]) * price[t] for t in range(n_time))
+peak_cost = peak_demand * peak_charge_rate
+model.setObjective(energy_cost + peak_cost, GRB.MINIMIZE)
+
+# Optimize the model
+model.optimize()
+
+# Output results
+if model.Status == GRB.OPTIMAL:
+    print(f"Optimal Peak Demand: {peak_demand.X:.2f} kW")
+    print(f"Optimal Total Cost: ${model.ObjVal:.2f}")
+
+    # Extract results
+    discharge_schedule = [discharge[t].X for t in range(n_time)]
+    charge_schedule = [charge[t].X for t in range(n_time)]
+    soc_levels = [soc[t].X for t in range(n_time)]
+
+    # Visualization
+    time_range = range(n_time)
+    fig, axes = plt.subplots(4, 1, figsize=(10, 15))
+
+    axes[0].plot(time_range, demand, label='Demand (kWh)')
+    axes[0].set_title('Demand')
+    axes[0].legend()
+
+    axes[1].plot(time_range, price, color='orange', label='Price ($/kWh)')
+    axes[1].set_title('Price')
+    axes[1].legend()
+
+    axes[2].plot(time_range, discharge_schedule, label='Discharge (kW)')
+    axes[2].plot(time_range, charge_schedule, label='Charge (kW)')
+    axes[2].set_title('ESS Charge and Discharge')
+    axes[2].legend()
+
+    axes[3].plot(time_range, soc_levels, label='State of Charge (SOC)')
+    axes[3].set_title('State of Charge')
+    axes[3].legend()
+
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No optimal solution found.")
